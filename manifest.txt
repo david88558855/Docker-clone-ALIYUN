@@ -28,4 +28,4 @@ certd
 easytier
 gitea
 act_runner
-ttdybridge
+ttydbridge
