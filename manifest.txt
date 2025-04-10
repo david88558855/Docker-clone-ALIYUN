@@ -15,7 +15,6 @@ sub
 sublink
 subweb
 subconverter
-chuanhuchatgpt
 ddns-go
 linux-command
 samba
