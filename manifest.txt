@@ -38,3 +38,4 @@ aipan-netdisk-search-simple
 ani-rss
 frp-panel
 gostc
+aingdesk
