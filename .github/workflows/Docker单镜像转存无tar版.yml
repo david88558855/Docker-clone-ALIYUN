@@ -1,14 +1,24 @@
 name: Docker单镜像转存无tar版（ACR兼容修复版）
 
-# 修复说明：
-# 原版用 docker pull/tag/push + docker manifest create/push 搬运镜像，
-# 会把源镜像自带的 OCI 1.1 attestation（config = application/vnd.oci.empty.v1+json）
-# 一起推给阿里云 ACR，ACR 不支持该 manifest class，导致：
-#   error from registry: unknown manifest class for application/vnd.oci.empty.v1+json
-# 本版改用 skopeo 直接从源仓库复制到 ACR，并用 --format v2s2 输出 Docker schema2
-# 清单，从而剔除 attestation，且一次性保留全部架构。
+# ============================================================================
+# 修复说明（第二版）
+# ----------------------------------------------------------------------------
+# 报错链：
+#   1) docker pull/tag/push + docker manifest  -> unknown manifest class for
+#      application/vnd.oci.empty.v1+json
+#   2) skopeo copy --all --format v2s2         -> unsupported image-specific
+#      operation on artifact with type
+#      "application/vnd.docker.attestation.manifest.v1+json"
+# 两次失败根因相同：源镜像索引里带 OCI 1.1 attestation（provenance/SBOM），
+# 其 config 是空描述符。skopeo 的 --all 是「全有或全无」，无法跳过它，
+# --format v2s2 也无法把它转成镜像清单，所以必然失败。
+#
+# 本版做法：用 regctl index create 只挑选真实平台（linux/amd64、linux/arm64 …）
+# 的子镜像，重新「组装」一个全新的索引再推到 ACR。attestation 的 platform 是
+# unknown/unknown，不在挑选列表里，自然被彻底剔除。
 #
 # secrets 名称与原版完全一致，无需改动仓库配置。
+# ============================================================================
 
 on:
   workflow_dispatch:
@@ -25,6 +35,21 @@ on:
         description: '自定义Docker镜像的版本号，默认跟随上方的版本如latest'
         required: false
         default: ''
+      amd64:
+        description: '拉取x86_64架构'
+        required: true
+        default: true
+        type: boolean
+      arm64:
+        description: '拉取arm64架构'
+        required: true
+        default: true
+        type: boolean
+      armv7:
+        description: '拉取armv7架构'
+        required: false
+        default: false
+        type: boolean
 
 env:
   DOCKER_REGISTRY: "${{ secrets.DOCKER_REGISTRY }}"
@@ -34,24 +59,32 @@ env:
   line: "${{ github.event.inputs.image_name }}"
   name: "${{ github.event.inputs.name }}"
   aliname: "${{ github.event.inputs.aliname }}"
+  amd64: "${{ github.event.inputs.amd64 }}"
+  arm64: "${{ github.event.inputs.arm64 }}"
+  armv7: "${{ github.event.inputs.armv7 }}"
+  # 固定 regctl 版本，避免 runner 工具升级导致「什么都没改却突然失败」
+  REGCTL_VERSION: "v0.11.6"
 
 jobs:
   transfer:
     runs-on: ubuntu-latest
     steps:
-    - name: 安装 skopeo
+    - name: 安装 regctl
       run: |
-        sudo apt-get update
-        sudo apt-get install -y skopeo
+        curl -fsSL -o /tmp/regctl \
+          "https://github.com/regclient/regclient/releases/download/${REGCTL_VERSION}/regctl-linux-amd64"
+        sudo install -m 0755 /tmp/regctl /usr/local/bin/regctl
+        regctl version
 
     - name: 登录阿里云 ACR
-      run: echo "$DOCKER_REGISTRY_PASSWORD" | skopeo login "$DOCKER_REGISTRY" -u "$DOCKER_REGISTRY_USER" --password-stdin
+      # docker login 的凭证写入 ~/.docker/config.json，regctl 会自动读取，
+      # 因此 regctl 不需要再单独登录。
+      run: echo "$DOCKER_REGISTRY_PASSWORD" | docker login "$DOCKER_REGISTRY" -u "$DOCKER_REGISTRY_USER" --password-stdin
 
     - name: 解析镜像名与版本号
       id: meta
       run: |
         set -e
-        # 取最后一段，如 xhofe/alist:latest -> alist:latest
         image_name_tag=$(echo "$line" | awk -F'/' '{print $NF}')
         image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
         image_tag=$(echo "$image_name_tag" | awk -F':' '{print $2}')
@@ -62,16 +95,28 @@ jobs:
         echo "TARGET=$TARGET" >> $GITHUB_ENV
         echo "目标镜像：$TARGET"
 
-    - name: 转存镜像（v2s2，剔除 OCI attestation）
+    - name: 重建干净索引并推送（剔除 attestation）
       run: |
-        # --all       : 复制多架构索引及全部平台镜像
-        # --format v2s2: 转成 Docker schema2，ACR 完全兼容，不携带 OCI attestation
-        # --remove-signatures: 不搬运签名（ACR 不需要）
-        skopeo copy --all --format v2s2 --remove-signatures \
-          "docker://$line" \
-          "docker://$TARGET"
+        set -euo pipefail
+        # 按勾选的架构组装 --platform 参数；attestation 是 unknown/unknown，
+        # 不会被列进来，因此重建出的索引不含它。
+        args=()
+        [[ "$amd64" == "true" ]] && args+=(--platform linux/amd64)
+        [[ "$arm64" == "true" ]] && args+=(--platform linux/arm64)
+        [[ "$armv7" == "true" ]] && args+=(--platform linux/arm/v7)
+        if [ ${#args[@]} -eq 0 ]; then
+          echo "错误：至少要勾选一个架构" >&2
+          exit 1
+        fi
+
+        echo "将只搬运以下平台：${args[*]}"
+        # 若源镜像缺少某个被勾选的架构，regctl 会报错。
+        # 可先看源镜像实际平台：regctl image manifest "$line"
+        regctl index create "$TARGET" \
+          --ref "$line" \
+          "${args[@]}"
 
     - name: 验证推送结果
       run: |
-        echo "目标镜像的顶层清单："
-        skopeo inspect --raw "docker://$TARGET"
+        echo "目标镜像清单（应只有真实平台，无 unknown/unknown 的 attestation 条目）："
+        regctl manifest get "$TARGET"
